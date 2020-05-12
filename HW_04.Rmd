@@ -1,0 +1,377 @@
+---
+title: "Homework 4"
+author: "NAME!"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Load libraries and set theme here:
+```{r, echo=FALSE}
+#plotting and exploring
+library(tidyverse) #for plotting and summarizing
+library(GGally) #for nice scatterplot matrix 
+library(ggridges) #for joy/ridge plots
+library(corrplot) #for basic correlation matrix plot
+library(naniar) #for exploring missing values
+library(pdp) #for partial dependence plots, MARS models
+
+#making things look nice
+library(lubridate) #for nice dates
+library(knitr) #for nice tables
+library(scales) #for nice labels on graphs
+library(gridExtra) #for arranging plots
+library(broom) #for nice model output
+
+#data
+library(ISLR) #for data
+library(moderndive) #for data
+
+#modeling
+library(rsample) #for splitting data
+library(recipes) #for keeping track of any transformations we do
+library(caret) #for modeling
+library(leaps) #for variable selection
+library(glmnet) #for LASSO
+library(earth) #for MARS models
+library(vip) #NEW for importance plots
+
+theme_set(theme_minimal())
+```
+
+The goal of this homework assignment is to bring together all the topics we've learned thus far, plus one we'll be talking about next Thursday. We'll be using the King County Housing dataset which you should now be somewhat familiar with.
+
+# Pre-modeling
+
+First, we separate the data into training, `house_train`, and testing, `house_test` datasets. And, guess what? We're going to use that testing data later on!
+
+```{r}
+#Split the data into training and test groups
+set.seed(4839) #for reproducibility
+house_split <- initial_split(house_prices, 
+                             prop = .7)
+house_train <- training(house_split)
+house_test <- testing(house_split)
+```
+
+Next, based mostly on previous work you have done, we will create a model recipe and variable transformation steps. The `update_role()` step allows us to keep those variables that we transformed in `step_mutate()`, but will not allow them not use them as predictors in the models.
+
+```{r}
+mod_rec <- 
+  recipe(price ~ bedrooms + bathrooms + sqft_living + 
+                     sqft_lot + sqft_above + floors + waterfront + 
+                     view + condition + grade + yr_built + 
+                     yr_renovated,
+                    data = house_train) %>% 
+  step_log(price, sqft_living, sqft_above, sqft_lot) %>% 
+  step_other(grade, condition, threshold = .05) %>% 
+  step_mutate(good_view = ifelse(view == 0, 0, 1),
+              age_2015 = 2015 - yr_built,
+              renovated_last_10 = ifelse(yr_renovated > 2005, 
+                                         "yes", "no")) %>% 
+  update_role(view, yr_renovated, yr_built, 
+              new_role = "old vars")
+```
+
+We apply the the transformations to both the training and testing datasets.
+
+```{r}
+final_house_train <- mod_rec %>%
+  prep() %>%
+  bake(new_data = house_train)
+
+final_house_test <- mod_rec %>% 
+  prep() %>% 
+  bake(new_data = house_test)
+```
+
+Lastly, we create a function that will allow us to assess our models on the price scale. Because we will be using a log-transformed response variable, `log(price)`, in most of our models, the RMSE would by default be on the `log(price)` scale. But, we can write a function and use it in the `train` function from `caret` to compute the RMSE for the response transformed back to the `price` scale.
+
+```{r}
+model_stats <- function(data, lev = NULL, model = NULL) {
+  
+  stats <- defaultSummary(data, lev = lev, model = model)
+  
+  transf_rmse <- function (pred, obs) {
+    sqrt(mean((exp(obs) - exp(pred))^2))
+  }
+  
+  trmse <- transf_rmse(pred = data$pred,
+                       obs = data$obs)
+  c(tRMSE = trmse, stats)
+}
+```
+
+# OLS
+
+The code below will fit an ordinary least squares regression. There are a couple new things to notice: 1. the `summaryFunction` argument in `trainControl` is `model_stats`, which is the function we created in the previous step that will compute RMSE based on `price` rather than `log(price)`, and 2. the `returnResamp` argument is `"all"` rather than the defaul `"best"` which means we get the detailed results for each of the folds for ALL the tuning parameters we evaluate rather than for just the best model. 
+
+```{r}
+set.seed(327) 
+house_ols <- train(
+  mod_rec,
+  data = house_train, 
+  method = "lm",
+  trControl = trainControl(method = "cv", 
+                           number = 5, 
+                           summaryFunction = model_stats,  
+                           returnResamp = "all"), 
+  na.action = na.omit
+)
+```
+
+a. Explain what the cross validation process is doing in this scenario. 
+
+b. The code below computes the cross-validated RMSE on the `price` scale and gives an estimate of the standard error of the cross-validated RMSE. What does the cross-validated RMSE tell us in the context of the data? That number seems huge! Why is it reasonable that it is so large?
+
+```{r}
+house_ols$results %>% 
+  mutate(tRMSESE = tRMSESD/sqrt(5)) %>% 
+  select(tRMSE, tRMSESE)
+```
+
+c. Examine the coefficients of the final model, which I've printed below. Are there any coefficients that surprise you? If so, why? How are the coefficients from this final model estimated?
+
+```{r}
+summary(house_ols$finalModel) %>% 
+  coefficients() %>% 
+  tidy()
+```
+
+d. Another way we can visually examine how well our model performs is by looking at a scatterplot of the observed vs. predicted values, which is shown below. (See the footnote^[It was in the `predict()` function in the `mutate()` where I made one of my errors. I used the `final_house_train` dataset rather than `house_train` because I didn't realize the transformations would be done inside the `predict()` function. Well, they are! So, I was using `final_house_train` instead and the variables were being transformed twice. So the most expensive house price was predicted to be only \$100,000! It took me well over an hour to debug that :(] about my initial bug/mistake in this code if you'd like.) What do you learn from this plot?
+
+```{r}
+final_house_train %>% 
+  mutate(pred_price = predict(house_ols, newdata = house_train)) %>% 
+  ggplot(aes(x = exp(price), y = exp(pred_price))) +
+  geom_point(size = .5, alpha = .5) +
+  geom_abline(color = "purple") +
+  geom_smooth(se = FALSE, color = "orange", size = .5) +
+  scale_x_continuous(breaks = seq(0,7000000,500000),
+                     labels = scales::dollar_format(scale = 1/1000000,
+                                                    accuracy = .5)) +
+  scale_y_continuous(breaks = seq(0,7000000,500000),
+                     labels = scales::dollar_format(scale = 1/1000000,
+                                                    accuracy = .5)) +
+  labs(x = "Observed House Price (Millions)", 
+       y = "Predicted House Price  (Millions)")
+```
+
+e. Below, I have computed the RMSE on the entire training dataset. How is this different from the cross-validated RMSE, both in size and in how it is calculated?
+
+```{r}
+final_house_train %>% 
+  mutate(pred_price = predict(house_ols, newdata = house_train)) %>% 
+  summarize(RMSE = sqrt(mean((exp(price) - exp(pred_price))^2)))
+
+```
+
+f. Create the same graph and compute the RMSE using the `house_test` data, rather than the `house_train` data. What do you learn?
+
+
+# Stepwise
+
+We will skip this step. My code was taking forever to run, even when I had very few `nvmax` values. I will further investigate.
+
+```{r, cache=TRUE, eval=FALSE, echo=FALSE}
+# house_step <- train(
+#   mod_rec,
+#   data = house_train,
+#   method = "leapForward", 
+#   tuneGrid = data.frame(nvmax = 15:16), 
+#   trControl = trainControl(method = "cv", 
+#                            number = 5, 
+#                            summaryFunction = model_stats,  
+#                            returnResamp = "all"), 
+#   na.action = na.omit
+# )
+```
+
+
+# Lasso
+
+I first tried fitting the lasso model using the code below, which returns an error. When I googled the error, I learned that it is pretty much a default error for a variety of things that might have gone wrong. I thought maybe it had to do with the categorical variables, so I tried using `mod_rec %>% step_dummy(all_nominal())` for the model instead. That leads to the same error. I'm still a bit perplexed on this one, but thankfully found another solution. So, keep reading.
+
+```{r, eval=FALSE}
+lambda_grid <- 10^seq(-4, -1 , length = 50)
+
+set.seed(327)
+house_lasso1 <- train(
+  mod_rec,
+  data = house_train, 
+  method = "glmnet",
+  tuneGrid = data.frame(alpha = 1, lambda = lambda_grid),
+  trControl = trainControl(method = "cv",
+                           number = 5,
+                           #summaryFunction = model_stats,
+                           returnResamp = "all"),
+  na.action = na.omit
+)
+```
+
+Here, I have instead used the `final_house_train` dataset, which applies the transformations to the variables in the dataset. So, `price` is actually `log(price)` and the other variables have the transformations notes in the `recipe` steps in `mod_rec`. 
+
+I made a couple other changes in the code. First, notice that in `trainControl`, I added an argument called `selectionFuntion` and set it to `"best"`. This is the default behavior and what we have always used, but you can change it to `"oneSE"` which would instead consider the best model the smallest model within one SE of the best model, where the SE is the standard error of whichever metric is being used to evaluate the model (usually RMSE). Speaking of evaluation metrics, I also changed that to `metric = "tRMSE"` which is the RMSE computed from the back-transformed data. In changing the metric, I also had to add `maximize = FALSE` so that it knows it should try to minimize that metric. 
+
+```{r}
+lambda_grid <- 10^seq(-4, -1 , length = 50)
+
+
+set.seed(327)
+house_lasso <- train(
+  price ~.,
+  data = final_house_train, 
+  method = "glmnet",
+  tuneGrid = data.frame(alpha = 1, lambda = lambda_grid),
+  trControl = trainControl(method = "cv",
+                           number = 5,
+                           summaryFunction = model_stats,
+                           returnResamp = "all",
+                           selectionFunction = "best"),
+  na.action = na.omit,
+  metric = "tRMSE", 
+  maximize = FALSE
+)
+
+```
+
+a. Because we want to summarize the results in terms of `price` rather than `log(price)`, we will once again compute the cross-validated RMSE and its standard error. Pipe this into `ggplot()` and create a graph with the following:
+
+* Cross-validated RMSE (`tRMSE`) on the y-axis, $\lambda$ on the x-axis but use `scale_x_log10()`, and those pairs of points represented as points on the plot.  
+* From each ($\lambda$, `tRMSE`) point extend a line segment one standard error in each direction. Check out the `geom_pointrange()` function.  
+* **EXTRA CHALLENGE**: Include a horizontal line for the cv RMSE that is one standard error from the smallest cv RMSE.  
+* **EXTRA CHALLENGE**: Include vertical lines for the $\lambda$ with the smallest cv RMSE and the largest $\lambda$ with a cv RMSE within one SE of the smallest cv RMSE. (REMOVE `eval=FALSE` before knitting!!)
+
+```{r, eval=FALSE}
+house_lasso$results %>% 
+  mutate(tRMSESE = tRMSESD/sqrt(5)) %>% 
+  select(lambda, tRMSE, tRMSESE)
+```
+
+b. Look at the coefficients of this model. How many variables/terms were set to zero? Any interesting coefficients?
+
+```{r}
+best_lambda <- house_lasso$bestTune$lambda
+coefficients(house_lasso$finalModel, s = best_lambda)
+```
+
+c. Now, fit a new lasso model that chooses the best model to be the smallest model (model with the largest $\lambda$ within one SE of the best model. Print the coefficients for that model. What has changed?
+
+d. For the model you just fit in the previous step, create the same graph and compute the test data RMSE like you did in OLS part f. Since we used `final_house_train` to build the model, you will need to use `final_house_test` in the `predict()` function. How does this model compare to the OLS model?
+
+
+# KNN
+
+Next, we will examine a K-nearest neighbors model. If you have not done so already, I would HIGHLY recommend working through the KNN in-class exercises.
+
+This is where I ran into yet another error in my code. When I tried using the same `recipe` as in the other models, with the additional centering, scaling, and dummy variable creation steps, the KNN model erred. out. I'm still investigating why that happened. 
+
+Instead we will proceed with a model with fewer variables. And, since it is not required for this model since there are no assumptions, we do not log transform any variables. 
+
+
+```{r}
+mod_rec_new <- recipe(price ~ bathrooms + bedrooms + sqft_living +
+                        sqft_lot + waterfront + grade + condition,
+                    data = house_train) %>% 
+#  step_log(price, sqft_living) %>% 
+  step_other(grade, condition, threshold = .05) %>% 
+  step_center(all_numeric(), -all_outcomes()) %>%
+  step_scale(all_numeric(), -all_outcomes()) %>%
+  step_dummy(all_nominal())
+```
+
+The `cache=TRUE` in the code chunk option will store your results so they don't have to be re-run when you knit the file. It will help knit the document more quickly.
+
+```{r, cache=TRUE}
+set.seed(327)
+house_knn <- train(
+  mod_rec_new, 
+  data = house_train, 
+  method = "knn", 
+  trControl = trainControl(method = "cv",
+                           number = 5,
+                          # summaryFunction = model_stats,
+                           returnResamp = "all"),
+  tuneGrid = data.frame(k = c(2,4,6,7,8,9,10))
+  ) 
+```
+
+
+a. Check out the results. Explain why it would be a good idea to modify my tuning grid for $k$. Then modify it and look at the new results. Modify it until you are satisfied with the results. Then, create the standard plot with RMSE on the y-axis and $k$ on the x-axis, and also show the RMSE SE. What is the best $k$ value? Why?
+
+b. With the best $k$ value you chose from above, compute the predicted house prices for the `house_test` data. Create the same graph of observed versus predicted values as you did with the previous two models and make some observations.
+
+c. Compute the test RMSE for the best model. How does it compare to the previous models?
+
+# MARS
+
+Next, we fit a MARS model.
+
+```{r, cache=TRUE}
+set.seed(327)
+
+house_mars <- train(
+  mod_rec,
+  data = house_train, 
+  method = "earth",
+  trControl = trainControl(method = "cv",
+                           number = 5,
+                           summaryFunction = model_stats,
+                           returnResamp = "all"),
+  tuneGrid = data.frame(degree = 1, nprune = 2:8)
+)
+```
+
+a. What is the cross-validated RMSE (on the `price` scale) for the best model?
+
+b. Let's look at the coefficients of the best model. Are you surprised by the number of variables? Create partial dependence plots for the variables that have hinge functions. Is the relationship what you expected? 
+
+```{r}
+house_mars$finalModel %>% 
+  coefficients() %>% 
+  tidy()
+```
+
+c. Create the same graph of observed versus predicted values as you did with the previous models and make some observations. (Be careful when you use the `predict()` function as you'll need to add an `as.vector()` - see the MARS in-class exercises.)
+
+d. Compute the test RMSE for the best model. How does it compare to the previous models?
+
+
+# Regression tree
+
+Lastly, we will fit a regression tree. For ease of not having to make another recipe, I kept the log transformations, although they are not needed. 
+
+```{r, cache=TRUE}
+set.seed(327)
+
+house_tree <- train(
+  mod_rec,
+  data = house_train, 
+  method = "rpart",
+  trControl = trainControl(method = "cv",
+                           number = 5,
+                           summaryFunction = model_stats,
+                           returnResamp = "all"),
+  tuneGrid = data.frame(cp = 10^seq(-4, -2 , length = 20))
+)
+
+```
+
+a. Examine a plot of the tuning parameter, `cp`, versus cross-validated RMSE (on the `price` scale). What `cp` parameter leads to the best model?
+
+
+b. Create a visualization of the regression tree. Explain how the first split was decided? How is it better than any other split? Explain how predicted values are determined from the tree.  
+
+c. Create the same graph of observed versus predicted values as you did with the previous models and make some observations.
+
+d. Compute the test RMSE for the best model. How does it compare to the previous models? 
+
+
+# Bringing it all together
+
+Summarize the results of all the models you evaluated by putting some key metrics into a table. (Google or use the R Markdown cheatsheet to help you make the table look nice). Ultimately, choose the model you will "put into production," ie. your final or "best" model. Explain why you chose the model you did. 
+
